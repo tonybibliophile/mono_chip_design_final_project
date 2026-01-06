@@ -1,147 +1,123 @@
-//Task.cpp
 #include "Config.h"
 #include "Shared.h"
-#include "Peripherals.h" // 包含 playTone 宣告
+#include "Peripherals.h"
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 
-// 引用外部函式
 void connectWiFi();
-void askGemini(String event); 
+void askGemini(String event);
 
-// --- 1. 邏輯任務 ---
-void TaskLogic(void *pvParameters) {
-  (void) pvParameters;
-  bool lastSoilDry = true;
-  SystemState lastState = S_WAIT_BT;
+volatile SystemState lastState = S_WAIT_BT;
+bool deviceConnected=false;
+BLECharacteristic* pTX;
+BLECharacteristic* pRX;
+std::string bleRxBuffer="";
 
-  for (;;) {
-    // A. 讀取感測器
-    int val = analogRead(PIN_SOIL);
-    // 更新全域變數
-    Data.isSoilDry = (val > SOIL_DRY_THRESHOLD);
-    
-    // B. 偵測邊緣事件
-    bool eventPlantWatered = (lastSoilDry && !Data.isSoilDry);
-    bool eventHumanRefill = reqHumanRefill;
-    if (reqHumanRefill) reqHumanRefill = false;
-    lastSoilDry = Data.isSoilDry;
+// ---------- BLE Callbacks ----------
+class ServerCB: public BLEServerCallbacks{
+  void onConnect(BLEServer* s){ deviceConnected=true; }
+  void onDisconnect(BLEServer* s){ deviceConnected=false; }
+};
+class CharCB: public BLECharacteristicCallbacks{
+  void onWrite(BLECharacteristic* c){ bleRxBuffer=c->getValue(); }
+};
 
-    unsigned long now = millis();
+// ---------- Logic Task ----------
+void TaskLogic(void* pv){
+ (void)pv;
+ bool lastSoilDry=true;
+ for(;;){
+   int val=analogRead(PIN_SOIL);
+   Data.isSoilDry=(val>SOIL_DRY_THRESHOLD);
+   bool eventPlantWatered=(lastSoilDry&&!Data.isSoilDry);
+   lastSoilDry=Data.isSoilDry;
+   unsigned long now=millis();
 
-    // C. 狀態機切換
-    switch (currentState) {
-      case S_WAIT_BT: currentState = S_IDLE; break;
-      default:
-        if (eventHumanRefill) { 
-           currentState = S_PARTY_HUMAN; Data.stateStartTime = now; 
-        }
-        else if (eventPlantWatered) { 
-           currentState = S_PARTY_PLANT; Data.stateStartTime = now; 
-        }
-        else if (Data.isSoilDry) {
-           currentState = S_WARN_PLANT;
-        }
-        else if (now - Data.stateStartTime > TIME_PARTY_HUMAN && (currentState == S_PARTY_HUMAN || currentState == S_PARTY_PLANT)) {
-           currentState = S_IDLE;
-        }
-        
-        // 倒數計時
-        static int tick = 0;
-        if(currentState == S_IDLE && ++tick >= 10) { 
-           tick = 0; if(Data.humanTimer > 0) Data.humanTimer--; 
-           if(Data.humanTimer == 0) currentState = S_WARN_HUMAN;
-        }
-        break;
-    }
+   switch(currentState){
+     case S_WAIT_BT: currentState=S_IDLE; break;
+     default:
+       if(eventPlantWatered){ currentState=S_PARTY_PLANT; Data.stateStartTime=now;}
+       else if(Data.isSoilDry) currentState=S_WARN_PLANT;
+       else if((currentState==S_PARTY_HUMAN||currentState==S_PARTY_PLANT)&&now-Data.stateStartTime>TIME_PARTY_HUMAN) currentState=S_IDLE;
 
-    // D. ★★★ AI 觸發點 ★★★
-    if (currentState != lastState) {
-      String prompt = "";
-      switch(currentState) {
-        case S_WARN_PLANT:  prompt = "My soil is dry, I am thirsty!"; break;
-        case S_WARN_HUMAN:  prompt = "Human forgot to drink water!"; break;
-        case S_PARTY_PLANT: prompt = "I just got watered! So happy!"; break;
-        case S_PARTY_HUMAN: prompt = "Human finally drank water!"; break;
-      }
-      // 只有在有話要說時才呼叫 AI
-      if (prompt != "") {
-        askGemini(prompt);
-      }
-      lastState = currentState;
-    }
+       static int tick=0;
+       if(currentState==S_IDLE && ++tick>=10){ tick=0; if(Data.humanTimer>0) Data.humanTimer--; if(Data.humanTimer==0) currentState=S_WARN_HUMAN;}
+       break;
+   }
 
-    vTaskDelay(100 / portTICK_PERIOD_MS);
-  }
+   if(currentState!=lastState){
+     String prompt="";
+     switch(currentState){
+       case S_WARN_PLANT: prompt="My soil is dry!"; break;
+       case S_WARN_HUMAN: prompt="Human forgot to drink!"; break;
+       case S_PARTY_PLANT: prompt="I just got watered!"; break;
+       case S_PARTY_HUMAN: prompt="Human drank water!"; break;
+     }
+     if(prompt!="") askGemini(prompt);
+     lastState=currentState;
+   }
+   vTaskDelay(100/portTICK_PERIOD_MS);
+ }
 }
 
-// --- 2. 輸入任務 (藍牙) ---
-void TaskInput(void *pvParameters) {
-  (void) pvParameters;
-  for (;;) {
-    if (SerialBT.hasClient()) {
-      bool shouldTriggerParty = false;
-      if (SerialBT.available()) {
-        String s = SerialBT.readStringUntil('\n'); s.trim();
-        if (s.length() > 0) {
-          
-          if (s.equalsIgnoreCase("Water")) {
-            Data.humanTimer = Data.humanMaxSeconds; shouldTriggerParty = true;
-          } 
-          // 切換個性
-          else if (s.equalsIgnoreCase("Kind")) { currentPersonality = PER_KIND; askGemini("I decided to be kind."); }
-          else if (s.equalsIgnoreCase("Mean")) { currentPersonality = PER_MEAN; askGemini("I decided to be mean."); }
-          else if (s.equalsIgnoreCase("Playful")) { currentPersonality = PER_PLAYFUL; askGemini("I decided to be playful."); }
-          // 設定時間
-          else {
-            float m = s.toFloat();
-            if (m > 0) { Data.humanMaxSeconds = (long)(m*60); Data.humanTimer = Data.humanMaxSeconds; }
-          }
-        }
-      }
-      if (shouldTriggerParty) reqHumanRefill = true;
-    }
-    vTaskDelay(50 / portTICK_PERIOD_MS);
-  }
+// ---------- Display Task ----------
+void TaskDisplay(void* pv){
+ (void)pv;
+ for(;;){
+   unsigned long now=millis();
+   drawCurrentStateView(now);
+   //updateLCDText(now);
+   vTaskDelay(30/portTICK_PERIOD_MS);
+ }
 }
 
-// --- 3. 顯示任務 ---
-void TaskDisplay(void *pvParameters) {
-  (void) pvParameters;
-  for (;;) {
-    unsigned long now = millis();
-    drawCurrentStateView(now);
-    updateLCDText(now);
-    vTaskDelay(30 / portTICK_PERIOD_MS);
-  }
+// ---------- Sound Task ----------
+void TaskSound(void* pv){
+ (void)pv;
+ SystemState lastS=S_WAIT_BT;
+ for(;;){
+   if(currentState!=lastS){
+     if(currentState==S_PARTY_HUMAN){ playTone(NOTE_G4,80); playTone(NOTE_C5,80); playTone(NOTE_E5,80); playTone(0,0);}
+     else if(currentState==S_PARTY_PLANT){ playTone(NOTE_C6,100); playTone(NOTE_C6,100); playTone(0,0);}
+     lastS=currentState;
+   }
+   switch(currentState){
+     case S_WARN_HUMAN: playTone(800,200); playTone(1200,200); break;
+     case S_WARN_PLANT: playTone(NOTE_G5,400); playTone(0,2000); break;
+     default: playTone(0,100); break;
+   }
+ }
 }
 
-// --- 4. 聲音任務 (關鍵修復：使用 playTone) ---
-void TaskSound(void *pvParameters) {
-  (void) pvParameters;
-  SystemState lastState = S_WAIT_BT;
+// ---------- BLE Input Task ----------
+void TaskInput(void* pv){
+ (void)pv;
+ BLEDevice::init(BLE_DEVICE_NAME);
+ BLEServer* srv=BLEDevice::createServer();
+ srv->setCallbacks(new ServerCB());
+ BLEService* svc=srv->createService(BLE_SERVICE_UUID);
+ pTX=svc->createCharacteristic(BLE_CHAR_TX_UUID,BLECharacteristic::PROPERTY_NOTIFY);
+ pTX->addDescriptor(new BLE2902());
+ pRX=svc->createCharacteristic(BLE_CHAR_RX_UUID,BLECharacteristic::PROPERTY_WRITE);
+ pRX->setCallbacks(new CharCB());
+ svc->start();
+ srv->getAdvertising()->start();
 
-  for (;;) {
-    // One-shot 音效
-    if (currentState != lastState) {
-       if (currentState == S_PARTY_HUMAN) {
-         playTone(NOTE_G4, 80); playTone(NOTE_C5, 80); playTone(NOTE_E5, 80); playTone(0,0);
-       }
-       else if (currentState == S_PARTY_PLANT) {
-         playTone(NOTE_C6, 100); playTone(NOTE_C6, 100); playTone(0,0);
-       }
-       lastState = currentState;
-    }
-    
-    // 背景音 (Loop)
-    switch (currentState) {
-      case S_WARN_HUMAN: 
-        playTone(800, 200); playTone(1200, 200); 
-        break;
-      case S_WARN_PLANT: 
-        playTone(NOTE_G5, 400); playTone(0, 2000); // 悲傷間歇音
-        break;
-      default: 
-        playTone(0, 100); // 靜音
-        break;
-    }
-  }
+ for(;;){
+   if(!bleRxBuffer.empty()){
+     String cmd=String(bleRxBuffer.c_str()); bleRxBuffer.clear();
+     cmd.trim();
+     if(cmd.equalsIgnoreCase("water")) { currentState=S_PARTY_PLANT; Data.stateStartTime=millis(); }
+     else if(cmd.equalsIgnoreCase("dry")) { currentState=S_WARN_PLANT; }
+     else if(cmd.equalsIgnoreCase("reset")) { currentState=S_IDLE; }
+
+     if(deviceConnected){
+       String msg="State: "+String(currentState);
+       pTX->setValue(msg.c_str()); pTX->notify();
+     }
+   }
+   vTaskDelay(50/portTICK_PERIOD_MS);
+ }
 }

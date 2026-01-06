@@ -1,24 +1,31 @@
-//Peripherals.cpp
 #include "Peripherals.h"
 #include "Config.h"
 #include "Shared.h"
 
+// 定義螢幕物件
 U8G2_SH1106_128X64_NONAME_F_4W_SW_SPI u8g2(U8G2_R0, PIN_OLED_CLK, PIN_OLED_MOSI, PIN_OLED_CS, PIN_OLED_DC, PIN_OLED_RES);
 LiquidCrystal_I2C lcd(LCD_ADDRESS, 16, 2); 
-BluetoothSerial SerialBT;
 
 void initPeripherals() {
-  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-  lcd.init(); lcd.backlight(); lcd.clear();
-  lcd.print("System Init...");
+  //Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
   
-  u8g2.begin(); u8g2.setDrawColor(1);
+  //lcd.init(); 
+  
+  // ▼▼▼ 修改這裡：關閉 LCD 背光與顯示 (若你想省電或不想顯示) ▼▼▼
+  // 如果你想要正常顯示，請改回 lcd.backlight();
+  //lcd.noBacklight(); 
+  //lcd.noDisplay();
+  // ▲▲▲▲▲▲
+  
+  // lcd.print("System Init..."); // 因為關閉了顯示，這行也可以省略
+  
+  u8g2.begin(); 
+  u8g2.setDrawColor(1);
   pinMode(PIN_BUTTON, INPUT_PULLUP);
   
   ledcSetup(BUZZER_CHANNEL, 5000, 8);
   ledcAttachPin(PIN_BUZZER, BUZZER_CHANNEL);
   
-  //SerialBT.begin("Smart_Plant_AI");
 }
 
 void playTone(int freq, int durationMs) {
@@ -26,6 +33,10 @@ void playTone(int freq, int durationMs) {
   else ledcWriteTone(BUZZER_CHANNEL, 0);
   if (durationMs > 0) vTaskDelay(durationMs / portTICK_PERIOD_MS);
 }
+
+// ... (後面的動畫繪圖程式碼保持不變) ...
+// 請保留原本下方的 drawThickLine, view_WaitBT 等所有函式
+// ...
 
 // --- 動畫繪圖區 (把 V4 的靈魂裝回來) ---
 
@@ -143,6 +154,7 @@ void drawCurrentStateView(unsigned long now) {
 
 // --- LCD 顯示總管 (維持不變) ---
 void updateLCDText(unsigned long now) {
+  return; // ★ 加這一行：直接跳出，忽略下面所有程式碼，測試用
   static int cnt = 0;
   if (++cnt > 5) { cnt = 0;
     
